@@ -40,31 +40,89 @@ def ar_distance_measurer():
             <div style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 4px; height: 4px; background: red; border-radius: 50%;"></div>
         </div>
         <div style="position: absolute; bottom: 20px; width: 100%; text-align: center; display: flex; justify-content: center; gap: 15px;">
-            <button id="btnAction" style="padding: 12px 24px; background: #FF4B4B; color: white; border: none; border-radius: 30px; font-weight: bold;">시작점 고정</button>
-            <button id="btnReset" style="padding: 12px 24px; background: #555; color: white; border: none; border-radius: 30px;">초기화</button>
+            <button id="btnAction" style="padding: 12px 24px; background: #FF4B4B; color: white; border: none; border-radius: 30px; font-weight: bold; cursor: pointer;">시작점 고정</button>
+            <button id="btnReset" style="padding: 12px 24px; background: #555; color: white; border: none; border-radius: 30px; cursor: pointer;">초기화</button>
         </div>
-        <div id="info" style="position: absolute; top: 15px; left: 15px; color: white; background: rgba(0,0,0,0.6); padding: 8px 15px; border-radius: 10px;">거리: 0.00m (준비)</div>
+        <div id="info" style="position: absolute; top: 15px; left: 15px; color: white; background: rgba(0,0,0,0.6); padding: 8px 15px; border-radius: 10px; font-size: 14px;">거리: 0.00m (준비)</div>
     </div>
+
     <script>
         const video = document.getElementById('video');
         const btnAction = document.getElementById('btnAction');
+        const btnReset = document.getElementById('btnReset');
         const info = document.getElementById('info');
+        
         let isMeasuring = false;
         let startAlpha = 0, startBeta = 0;
-        navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } }).then(s => { video.srcObject = s; });
         let currentOri = { alpha: 0, beta: 0 };
-        window.addEventListener('deviceorientation', e => { currentOri.alpha = e.alpha; currentOri.beta = e.beta; });
-        btnAction.onclick = () => {
-            if (!isMeasuring) {
-                startAlpha = currentOri.alpha; startBeta = currentOri.beta;
-                isMeasuring = true; btnAction.innerText = "끝점 지정";
+
+        // 카메라 시작
+        navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } })
+            .then(s => { video.srcObject = s; })
+            .catch(e => { alert("카메라를 시작할 수 없습니다. 권한을 확인해주세요."); });
+
+        // iOS 센서 권한 요청 함수
+        async function requestSensorPermission() {
+            if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+                try {
+                    const permissionState = await DeviceOrientationEvent.requestPermission();
+                    if (permissionState === 'granted') {
+                        window.addEventListener('deviceorientation', handleOrientation);
+                        return true;
+                    } else {
+                        alert("센서 권한이 거부되었습니다. 설정에서 허용해주세요.");
+                        return false;
+                    }
+                } catch (e) {
+                    alert("권한 요청 중 오류 발생");
+                    return false;
+                }
             } else {
+                window.addEventListener('deviceorientation', handleOrientation);
+                return true;
+            }
+        }
+
+        function handleOrientation(e) {
+            currentOri.alpha = e.alpha;
+            currentOri.beta = e.beta;
+        }
+
+        btnAction.onclick = async () => {
+            // 클릭 시 권한 확인 및 요청
+            const granted = await requestSensorPermission();
+            if (!granted) return;
+
+            if (!isMeasuring) {
+                // 시작점 저장
+                startAlpha = currentOri.alpha;
+                startBeta = currentOri.beta;
+                isMeasuring = true;
+                btnAction.innerText = "끝점 지정";
+                btnAction.style.background = "#007AFF";
+                info.innerText = "측정 중... 폰을 끝점으로 천천히 움직이세요.";
+            } else {
+                // 끝점 계산
                 const dAlpha = Math.abs(currentOri.alpha - startAlpha) * (Math.PI/180);
                 const dBeta = Math.abs(currentOri.beta - startBeta) * (Math.PI/180);
                 const dist = Math.sqrt(Math.pow(dAlpha, 2) + Math.pow(dBeta, 2)) * 1.5;
+                
+                info.innerText = "계산 완료: " + dist.toFixed(2) + "m";
+                // Streamlit으로 데이터 전송
                 window.parent.postMessage({type: 'streamlit:setComponentValue', value: dist}, '*');
                 btnAction.disabled = true;
+                btnAction.style.background = "#888";
             }
+        };
+
+        btnReset.onclick = () => {
+            isMeasuring = false;
+            btnAction.disabled = false;
+            btnAction.innerText = "시작점 고정";
+            btnAction.style.background = "#FF4B4B";
+            info.innerText = "거리: 0.00m (준비)";
+            // 리셋 시 0으로 보낼 수도 있음
+            window.parent.postMessage({type: 'streamlit:setComponentValue', value: 0}, '*');
         };
     </script>
     """
@@ -97,28 +155,35 @@ def analyze_and_draw(image_np, results_crack, dilation_iter):
 auto_distance = ar_distance_measurer()
 
 st.markdown("---")
-uploaded_file = st.file_uploader("균열 사진을 업로드하세요", type=["jpg", "png", "jpeg", "heic"])
+uploaded_file = st.file_uploader("📸 분석할 균열 사진을 업로드하세요", type=["jpg", "png", "jpeg", "heic"])
 
-# auto_distance가 None이 아닐 때만 실행
 if uploaded_file is not None:
-    # 거리가 측정되지 않았으면 기본값 1.0m 사용
-    dist_val = float(auto_distance) if auto_distance else 1.0
-    final_dist = st.number_input("📏 측정 거리 (미터)", value=dist_val, step=0.01)
+    # 측정된 값이 있으면 사용, 없으면 1.0m
+    initial_val = float(auto_distance) if auto_distance and auto_distance > 0 else 1.0
+    final_dist = st.number_input("📏 확정된 측정 거리 (미터)", value=initial_val, step=0.01)
     
-    analyze_btn = st.button("🚀 AI 분석 시작", type="primary")
+    analyze_btn = st.button("🚀 AI 분석 시작", type="primary", use_container_width=True)
     
     if analyze_btn:
-        image = ImageOps.exif_transpose(Image.open(uploaded_file))
-        img_array = np.array(image.convert("RGB"))
-        
-        # 스케일 계산
-        fov_radians = math.radians(70 / 2)
-        predicted_width_cm = 2 * (final_dist * 100) * math.tan(fov_radians)
-        cm_per_px = predicted_width_cm / img_array.shape[1]
-        
-        res = model_crack.predict(source=img_array, conf=0.25, verbose=False)
-        final_img, area_px, thick_px = analyze_and_draw(img_array, res, 1)
-        
-        st.image(final_img, use_container_width=True)
-        st.metric("📐 면적", f"{area_px * (cm_per_px**2):.2f} cm²")
-        st.metric("🔥 폭", f"{thick_px * (cm_per_px*10):.2f} mm")
+        with st.spinner("AI 분석 중..."):
+            image = ImageOps.exif_transpose(Image.open(uploaded_file))
+            img_array = np.array(image.convert("RGB"))
+            
+            # 스케일 계산
+            fov_radians = math.radians(70 / 2)
+            predicted_width_cm = 2 * (final_dist * 100) * math.tan(fov_radians)
+            cm_per_px = predicted_width_cm / img_array.shape[1]
+            
+            res = model_crack.predict(source=img_array, conf=0.25, verbose=False)
+            final_img, area_px, thick_px = analyze_and_draw(img_array, res, 1)
+            
+            st.image(final_img, use_container_width=True)
+            
+            col_m1, col_m2 = st.columns(2)
+            if area_px > 0:
+                area_cm2 = area_px * (cm_per_px**2)
+                thick_mm = thick_px * (cm_per_px*10)
+                col_m1.metric("📐 균열 면적", f"{area_cm2:.2f} cm²")
+                col_m2.metric("🔥 최대 균열 폭", f"{thick_mm:.2f} mm")
+            else:
+                st.warning("탐지된 균열이 없습니다.")
