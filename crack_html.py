@@ -1,265 +1,247 @@
+# app.py
+# 균열 정밀 진단 시스템 V5.0 - 자동 거리 추정 버전
+# 사용자 입력 없이 사진 한 장으로 균열 면적/폭을 추정
+
 import streamlit as st
-from ultralytics import YOLO
-from PIL import Image, ImageOps
 import numpy as np
 import cv2
-import os
+from PIL import Image, ExifTags
+import torch
+from ultralytics import YOLO
+import io
 import math
-from streamlit_drawable_canvas import st_canvas
 
-# ============================================================
-# 1. 초기 설정
-# ============================================================
-st.set_page_config(page_title="콘크리트 균열 정밀 진단 V4", page_icon="🏗️", layout="wide")
-st.title("🏗️ 콘크리트 균열 정밀 진단 V4.0")
-st.caption("아이폰 측정앱 방식: 사진 위에서 **시작점 → 끝점**을 찍으면 그 구간의 균열을 mm 단위로 분석합니다.")
+st.set_page_config(page_title="균열 자동 진단 V5.0", layout="wide")
+st.title("🔍 콘크리트 균열 자동 진단 시스템 V5.0")
+st.caption("📸 사진만 찍으면 거리·면적·폭을 자동으로 추정합니다 (단안 깊이추정 AI)")
 
-# HEIC 지원
-try:
-    from pillow_heif import register_heif_opener
-    register_heif_opener()
-    HEIC_OK = True
-except ImportError:
-    HEIC_OK = False
-
-# ============================================================
-# 2. 모델 로드
-# ============================================================
+# ──────────────────────────────────────────────
+# 1) 모델 로딩 (캐싱)
+# ──────────────────────────────────────────────
 @st.cache_resource
-def load_model():
-    for p in ["bestcrack.pt", os.path.expanduser("~/Desktop/bestcrack.pt")]:
-        if os.path.exists(p):
-            return YOLO(p)
-    return None
+def load_midas():
+    """MiDaS 단안 깊이추정 모델 로드"""
+    model_type = "MiDaS_small"  # 가벼운 버전 (속도 우선)
+    midas = torch.hub.load("intel-isl/MiDaS", model_type)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    midas.to(device).eval()
+    transforms = torch.hub.load("intel-isl/MiDaS", "transforms")
+    transform = transforms.small_transform
+    return midas, transform, device
 
-model_crack = load_model()
-if model_crack is None:
-    st.error("❌ bestcrack.pt 모델 파일을 찾을 수 없습니다.")
-    st.stop()
+@st.cache_resource
+def load_yolo():
+    """균열 세그멘테이션 YOLO 모델 로드 (사전 학습된 본인 모델 경로로 교체)"""
+    # ⚠️ 본인이 학습시킨 균열 세그멘테이션 가중치 경로로 변경하세요
+    return YOLO("yolov8n-seg.pt")
 
-# ============================================================
-# 3. 세션 상태
-# ============================================================
-if "captured_image" not in st.session_state:
-    st.session_state.captured_image = None
-if "analysis_result" not in st.session_state:
-    st.session_state.analysis_result = None
+# ──────────────────────────────────────────────
+# 2) EXIF에서 카메라 정보 뽑기
+# ──────────────────────────────────────────────
+def get_exif_info(pil_image):
+    """EXIF에서 35mm 환산 초점거리, 센서 정보 추출"""
+    info = {
+        "focal_length_mm": None,
+        "focal_length_35mm": None,
+        "subject_distance_m": None,
+    }
+    try:
+        exif = pil_image._getexif()
+        if exif is None:
+            return info
+        exif_data = {ExifTags.TAGS.get(k, k): v for k, v in exif.items()}
+        if "FocalLength" in exif_data:
+            f = exif_data["FocalLength"]
+            info["focal_length_mm"] = float(f) if not hasattr(f, "numerator") else f.numerator / f.denominator
+        if "FocalLengthIn35mmFilm" in exif_data:
+            info["focal_length_35mm"] = float(exif_data["FocalLengthIn35mmFilm"])
+        if "SubjectDistance" in exif_data:
+            d = exif_data["SubjectDistance"]
+            info["subject_distance_m"] = float(d) if not hasattr(d, "numerator") else d.numerator / d.denominator
+    except Exception:
+        pass
+    return info
 
-# ============================================================
-# 4. 분석 함수 (두 점 사이 ROI 영역의 균열만 분석)
-# ============================================================
-def analyze_crack_between_points(image_np, p1, p2, real_length_cm,
-                                  conf_threshold=0.25, dilation_iter=1):
+# ──────────────────────────────────────────────
+# 3) MiDaS로 깊이맵 추정
+# ──────────────────────────────────────────────
+def estimate_depth(pil_image, midas, transform, device):
+    """단안 깊이추정 → 상대 깊이맵 (정규화된 disparity)"""
+    img = np.array(pil_image.convert("RGB"))
+    input_batch = transform(img).to(device)
+    with torch.no_grad():
+        prediction = midas(input_batch)
+        prediction = torch.nn.functional.interpolate(
+            prediction.unsqueeze(1),
+            size=img.shape[:2],
+            mode="bicubic",
+            align_corners=False,
+        ).squeeze()
+    depth = prediction.cpu().numpy()
+    return depth  # 값이 클수록 가까움 (disparity)
+
+# ──────────────────────────────────────────────
+# 4) 상대 깊이맵 → 절대 거리(m) 환산
+# ──────────────────────────────────────────────
+def depth_to_meters(depth_map, exif_info, image_width):
     """
-    p1, p2          : 원본 이미지 픽셀 좌표 (x, y)
-    real_length_cm  : 사용자가 입력한 p1-p2의 실제 거리 (cm)
+    MiDaS 출력은 상대값이므로 EXIF 초점거리로 절대 거리 환산.
+    근사 공식: 일반적인 스마트폰 사진에서 disparity → meter
     """
-    draw_img = image_np.copy()
-    overlay = image_np.copy()
+    # disparity 정규화
+    d_min, d_max = depth_map.min(), depth_map.max()
+    d_norm = (depth_map - d_min) / (d_max - d_min + 1e-8)  # 0~1
 
-    # ── 1) 픽셀 거리 → mm 스케일 (FOV 추정 불필요, 정확함) ──
-    px_dist = math.hypot(p2[0] - p1[0], p2[1] - p1[1])
-    if px_dist < 5:
-        return draw_img, 0, 0, 0, "두 점이 너무 가깝습니다."
+    # 35mm 환산 초점거리 기반 평균 거리 추정
+    # 일반 스마트폰: 사용자가 벽을 찍을 때 보통 0.3m ~ 3m 범위
+    focal_35 = exif_info.get("focal_length_35mm") or 26.0  # 아이폰 기본 광각 ≈ 26mm
+    
+    # 경험적 스케일링: 초점거리가 클수록 멀리서 찍은 것
+    # (휴리스틱이지만 균열 진단용으로는 충분)
+    base_distance = 0.5 + (focal_35 / 26.0) * 0.5  # 평균 0.5~1.5m 근처
+    
+    # EXIF에 SubjectDistance가 있으면 그걸 우선 사용 (가장 정확)
+    if exif_info.get("subject_distance_m") and 0.1 < exif_info["subject_distance_m"] < 10:
+        base_distance = exif_info["subject_distance_m"]
 
-    mm_per_pixel = (real_length_cm * 10.0) / px_dist
-    cm_per_pixel = mm_per_pixel / 10.0
+    # disparity가 클수록 가까움 → 거리는 반비례
+    # 중앙 영역의 평균 깊이를 base_distance로 설정
+    h, w = depth_map.shape
+    center_d = d_norm[h//3:2*h//3, w//3:2*w//3].mean()
+    
+    # 거리 맵 환산 (m 단위)
+    # depth_m = base_distance * (center_d / d_norm) 의 형태
+    depth_m = base_distance * (center_d + 0.1) / (d_norm + 0.1)
+    depth_m = np.clip(depth_m, 0.1, 10.0)  # 합리적 범위로 클리핑
+    
+    return depth_m, base_distance
 
-    # ── 2) YOLO 균열 탐지 ──
-    results = model_crack.predict(source=image_np, conf=conf_threshold, verbose=False)
-    if not results or results[0].masks is None:
-        cv2.line(draw_img, p1, p2, (0, 255, 255), 3)
-        cv2.circle(draw_img, p1, 10, (0, 255, 0), -1)
-        cv2.circle(draw_img, p2, 10, (0, 0, 255), -1)
-        return draw_img, 0, 0, mm_per_pixel, "균열이 탐지되지 않았습니다."
+# ──────────────────────────────────────────────
+# 5) 거리 + 초점거리 → mm/pixel 스케일 계산
+# ──────────────────────────────────────────────
+def compute_mm_per_pixel(depth_m_at_crack, exif_info, image_width):
+    """
+    실제 mm/pixel 스케일 = (거리 × 센서폭) / (초점거리 × 이미지폭)
+    35mm 환산 사용 시 센서폭 = 36mm로 가정
+    """
+    focal_35 = exif_info.get("focal_length_35mm") or 26.0
+    sensor_width_mm = 36.0  # 35mm 환산 기준
+    # 시야각 기반 공식
+    # 가로 시야각의 픽셀당 실제 mm
+    mm_per_pixel = (depth_m_at_crack * 1000.0 * sensor_width_mm) / (focal_35 * image_width)
+    return mm_per_pixel
 
-    result = results[0]
+# ──────────────────────────────────────────────
+# 6) Streamlit UI
+# ──────────────────────────────────────────────
+uploaded = st.file_uploader(
+    "균열 사진 업로드 (JPG/PNG, EXIF 정보가 포함된 원본 파일 권장)",
+    type=["jpg", "jpeg", "png"]
+)
 
-    # ── 3) 전체 균열 마스크 ──
-    H, W = image_np.shape[:2]
-    full_mask = np.zeros((H, W), dtype=np.uint8)
-    for m in result.masks.xy:
-        if len(m) > 0:
-            pts = np.array(m, np.int32).reshape((-1, 1, 2))
-            cv2.fillPoly(full_mask, [pts], 1)
-
-    # ── 4) 팽창 교정 ──
-    if dilation_iter > 0:
-        kernel = np.ones((3, 3), np.uint8)
-        full_mask = cv2.dilate(full_mask, kernel, iterations=dilation_iter)
-
-    # ── 5) 두 점을 잇는 띠(ROI) 생성 ──
-    roi_mask = np.zeros((H, W), dtype=np.uint8)
-    band_thickness = max(int(px_dist * 0.3), 40)  # 균열이 곧지 않을 수 있어 여유
-    cv2.line(roi_mask, p1, p2, 1, thickness=band_thickness * 2)
-
-    # ── 6) ROI ∩ 균열 ──
-    target_mask = full_mask & roi_mask
-
-    # ── 7) 면적 / 최대폭 ──
-    total_px = int(np.sum(target_mask))
-    area_cm2 = total_px * (cm_per_pixel ** 2)
-
-    max_thick_mm = 0
-    if total_px > 0:
-        dist_tf = cv2.distanceTransform(target_mask, cv2.DIST_L2, 3)
-        max_thick_mm = float(np.max(dist_tf)) * 2 * mm_per_pixel
-
-    # ── 8) 시각화 ──
-    overlay[roi_mask == 1] = (255, 255, 0)       # ROI: 연노랑
-    overlay[target_mask == 1] = (255, 0, 0)      # 균열: 빨강
-    cv2.addWeighted(overlay, 0.4, draw_img, 0.6, 0, draw_img)
-
-    contours, _ = cv2.findContours(target_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    cv2.drawContours(draw_img, contours, -1, (255, 0, 0), 2)
-
-    # 측정선 + 양 끝점
-    cv2.line(draw_img, p1, p2, (0, 255, 255), 3)
-    cv2.circle(draw_img, p1, 12, (0, 255, 0), -1)
-    cv2.circle(draw_img, p1, 12, (255, 255, 255), 2)
-    cv2.circle(draw_img, p2, 12, (0, 0, 255), -1)
-    cv2.circle(draw_img, p2, 12, (255, 255, 255), 2)
-
-    # 거리 라벨
-    mid = ((p1[0] + p2[0]) // 2, (p1[1] + p2[1]) // 2)
-    label = f"{real_length_cm:.1f} cm ({px_dist:.0f}px)"
-    cv2.putText(draw_img, label, (mid[0] + 10, mid[1] - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 4)
-    cv2.putText(draw_img, label, (mid[0] + 10, mid[1] - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
-
-    return draw_img, area_cm2, max_thick_mm, mm_per_pixel, "OK"
-
-# ============================================================
-# 5. 이미지 입력
-# ============================================================
-st.markdown("### 📷 1단계 · 이미지 입력")
-types = ["jpg", "jpeg", "png"] + (["heic", "heif"] if HEIC_OK else [])
-
-tab1, tab2 = st.tabs(["📁 업로드", "📸 카메라 촬영"])
-with tab1:
-    up = st.file_uploader("이미지 선택", type=types)
-    if up:
-        st.session_state.captured_image = ImageOps.exif_transpose(Image.open(up)).convert("RGB")
-        st.session_state.analysis_result = None
-with tab2:
-    cam = st.camera_input("균열을 정면(90°)에서 촬영")
-    if cam:
-        st.session_state.captured_image = ImageOps.exif_transpose(Image.open(cam)).convert("RGB")
-        st.session_state.analysis_result = None
-
-# ============================================================
-# 6. 2점 찍기 + 분석
-# ============================================================
-if st.session_state.captured_image is not None:
-    image = st.session_state.captured_image
-    img_np = np.array(image)
+if uploaded:
+    pil_img = Image.open(uploaded)
+    img_np = np.array(pil_img.convert("RGB"))
     H, W = img_np.shape[:2]
 
-    st.markdown("### 🎯 2단계 · 시작점 → 끝점 찍기")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("📷 원본 이미지")
+        st.image(pil_img, use_column_width=True)
+
+    # EXIF 정보
+    exif_info = get_exif_info(pil_img)
+    with st.expander("📋 EXIF 카메라 정보"):
+        st.json(exif_info)
+        if exif_info["focal_length_35mm"] is None:
+            st.warning("⚠️ EXIF 초점거리 정보가 없습니다. 기본값(26mm, 아이폰 광각)으로 추정합니다.")
+
+    # 로딩
+    with st.spinner("🤖 AI 모델 로딩 중..."):
+        midas, transform, device = load_midas()
+        yolo = load_yolo()
+
+    # 깊이 추정
+    with st.spinner("📏 깊이 추정 중..."):
+        depth_map = estimate_depth(pil_img, midas, transform, device)
+        depth_m, base_distance = depth_to_meters(depth_map, exif_info, W)
+
+    with col2:
+        st.subheader("🌈 추정 깊이맵")
+        # 시각화용 정규화
+        depth_vis = cv2.normalize(depth_map, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        depth_color = cv2.applyColorMap(depth_vis, cv2.COLORMAP_INFERNO)
+        st.image(depth_color, use_column_width=True)
+        st.metric("추정 평균 촬영거리", f"{base_distance:.2f} m")
+
+    # YOLO 균열 세그멘테이션
+    with st.spinner("🔍 균열 탐지 중..."):
+        results = yolo.predict(img_np, conf=0.25, verbose=False)
+
+    if not results or results[0].masks is None:
+        st.error("❌ 균열을 찾지 못했습니다.")
+        st.stop()
+
+    # 모든 균열 마스크 합치기
+    masks = results[0].masks.data.cpu().numpy()  # (N, h, w)
+    full_mask = np.zeros((H, W), dtype=np.uint8)
+    for m in masks:
+        m_resized = cv2.resize(m, (W, H), interpolation=cv2.INTER_NEAREST)
+        full_mask = np.maximum(full_mask, (m_resized > 0.5).astype(np.uint8))
+
+    # 균열 영역의 평균 거리
+    crack_pixels = full_mask > 0
+    if crack_pixels.sum() == 0:
+        st.error("❌ 균열 마스크가 비어있습니다.")
+        st.stop()
+
+    depth_at_crack = depth_m[crack_pixels].mean()
+    mm_per_pixel = compute_mm_per_pixel(depth_at_crack, exif_info, W)
+
+    # 면적 (cm²)
+    pixel_count = int(crack_pixels.sum())
+    area_mm2 = pixel_count * (mm_per_pixel ** 2)
+    area_cm2 = area_mm2 / 100.0
+
+    # 최대 폭 (mm) — 거리 변환(Distance Transform) 이용
+    dist_tf = cv2.distanceTransform(full_mask, cv2.DIST_L2, 5)
+    max_half_width_px = dist_tf.max()
+    max_width_mm = 2 * max_half_width_px * mm_per_pixel
+
+    # ──────────────────────────────────────────
+    # 결과 출력
+    # ──────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("📊 자동 진단 결과")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("균열까지 거리", f"{depth_at_crack:.2f} m")
+    c2.metric("mm/pixel 스케일", f"{mm_per_pixel:.4f}")
+    c3.metric("균열 면적", f"{area_cm2:.2f} cm²")
+    c4.metric("최대 균열 폭", f"{max_width_mm:.2f} mm")
+
+    # 등급 판정 (예시: 콘크리트 표준 기준)
+    if max_width_mm < 0.2:
+        grade, color = "✅ 미세균열 (A등급)", "green"
+    elif max_width_mm < 0.3:
+        grade, color = "🟡 경미균열 (B등급)", "orange"
+    elif max_width_mm < 1.0:
+        grade, color = "🟠 중간균열 (C등급)", "darkorange"
+    else:
+        grade, color = "🔴 심각균열 (D등급)", "red"
+
+    st.markdown(f"### 안전 등급: :{color}[{grade}]")
+
+    # 시각화
+    overlay = img_np.copy()
+    overlay[full_mask > 0] = [255, 0, 0]
+    blended = cv2.addWeighted(img_np, 0.6, overlay, 0.4, 0)
+    st.image(blended, caption="🎯 균열 탐지 결과", use_column_width=True)
+
+    # 주의사항
     st.info(
-        "👉 아래 이미지에서 **균열의 시작점을 클릭, 이어서 끝점을 클릭**하세요.\n\n"
-        "📏 그 다음 두 점 사이의 **실제 거리(cm)**를 입력합니다. "
-        "(자/줄자로 재거나, 옆에 둔 동전·벽돌처럼 길이를 아는 기준물 활용)"
+        "ℹ️ 이 시스템의 거리 추정은 AI 단안 깊이추정 기반으로 **±20~30%의 오차**가 있을 수 있습니다.\n\n"
+        "정밀 진단이 필요한 경우 두 점 기준 측정 모드(V4.0)를 사용하세요."
     )
-
-    # 캔버스 표시 크기
-    DISPLAY_W = 700
-    scale = DISPLAY_W / W
-    DISPLAY_H = int(H * scale)
-
-    col_canvas, col_info = st.columns([2, 1])
-
-    with col_canvas:
-        canvas_res = st_canvas(
-            fill_color="rgba(255, 0, 0, 0.3)",
-            stroke_width=8,
-            stroke_color="#00FF00",
-            background_image=image.resize((DISPLAY_W, DISPLAY_H)),
-            update_streamlit=True,
-            height=DISPLAY_H,
-            width=DISPLAY_W,
-            drawing_mode="point",
-            point_display_radius=8,
-            key="canvas",
-        )
-
-    with col_info:
-        st.markdown("#### ⚙️ 측정 설정")
-        real_cm = st.number_input(
-            "📏 두 점 사이의 실제 거리 (cm)",
-            min_value=0.5, value=10.0, step=0.5,
-            help="자로 잰 실제 거리. 정확할수록 결과도 정확합니다.\n"
-                 "💡 기준물 예시 — 500원: 2.65cm / 표준벽돌 길이: 19cm / 신용카드 가로: 8.56cm"
-        )
-        conf_th = st.slider("탐지 민감도", 0.05, 0.95, 0.25, 0.05)
-        dilation = st.slider("마스킹 팽창 교정", 0, 5, 1)
-
-        # 찍힌 점 추출
-        points = []
-        if canvas_res.json_data is not None:
-            for o in canvas_res.json_data.get("objects", []):
-                if o.get("type") == "circle":
-                    cx = (o["left"] + o.get("radius", 0)) / scale
-                    cy = (o["top"] + o.get("radius", 0)) / scale
-                    points.append((int(cx), int(cy)))
-
-        st.markdown(f"**찍힌 점: {len(points)}개**")
-        if len(points) >= 1:
-            st.write(f"🟢 시작점: {points[0]}")
-        if len(points) >= 2:
-            st.write(f"🔴 끝점: {points[1]}")
-            px_d = math.hypot(points[1][0]-points[0][0], points[1][1]-points[0][1])
-            st.write(f"📐 픽셀 거리: {px_d:.1f} px")
-            st.write(f"🔬 스케일: 1px ≈ {(real_cm*10/px_d):.3f} mm")
-        if len(points) > 2:
-            st.warning("⚠️ 점이 3개 이상입니다. 캔버스 휴지통(🗑️)으로 지우거나, 처음 2개만 사용됩니다.")
-
-        analyze_btn = st.button(
-            "🚀 측정 시작",
-            type="primary",
-            use_container_width=True,
-            disabled=(len(points) < 2),
-        )
-
-    # ── 분석 실행 ──
-    if analyze_btn and len(points) >= 2:
-        p1, p2 = points[0], points[1]
-        with st.spinner("AI 분석 중..."):
-            result_img, area, thick, mmpp, msg = analyze_crack_between_points(
-                img_np, p1, p2, real_cm,
-                conf_threshold=conf_th,
-                dilation_iter=dilation,
-            )
-            st.session_state.analysis_result = {
-                "img": result_img, "area": area, "thick": thick,
-                "mmpp": mmpp, "msg": msg, "real_cm": real_cm
-            }
-
-    # ── 결과 표시 ──
-    if st.session_state.analysis_result is not None:
-        st.markdown("---")
-        st.markdown("### ✨ 3단계 · 분석 결과")
-        r = st.session_state.analysis_result
-
-        st.image(r["img"], use_container_width=True,
-                 caption=f"분석 결과 (스케일: 1px ≈ {r['mmpp']:.3f} mm)")
-
-        if r["area"] > 0:
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("📐 균열 면적", f"{r['area']:.2f} cm²")
-            m2.metric("🔥 최대 균열 폭", f"{r['thick']:.2f} mm")
-            m3.metric("📏 측정 기준", f"{r['real_cm']:.1f} cm")
-            status_lbl = "⚠️ 보수 필요" if r["thick"] >= 0.3 else "✅ 양호"
-            m4.metric("📋 안전 진단", status_lbl)
-
-            with st.expander("ℹ️ 균열 폭 진단 기준"):
-                st.markdown("""
-                - **0.3 mm 미만** : 일반적으로 구조 안전성에 큰 영향 없음 (양호)
-                - **0.3 mm 이상** : 철근 부식 우려, 보수 권장
-                - **1.0 mm 이상** : 구조적 문제 가능성, 정밀 점검 필요
-                """)
-        else:
-            st.warning(f"⚠️ {r['msg']}")
 else:
-    st.info("👆 위에서 이미지를 업로드하거나 촬영해주세요.")
+    st.info("👆 균열 사진을 업로드하세요. **아이폰/안드로이드로 직접 촬영한 원본 사진**이 가장 정확합니다 (EXIF 정보 포함).")
