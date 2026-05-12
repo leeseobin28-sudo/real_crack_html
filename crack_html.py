@@ -17,7 +17,7 @@ except ImportError:
     pass
 
 st.set_page_config(page_title="AR 실시간 균열 진단", page_icon="🏗️", layout="wide")
-st.title("🏗️ AR 실시간 균열 정밀 진단 V5.1")
+st.title("🏗️ AR 실시간 균열 정밀 진단 V5.2")
 
 # 2. 모델 로드
 @st.cache_resource
@@ -48,13 +48,10 @@ def analyze_captured_image(image_np, physical_dist_m, results_crack):
                 pts = np.array(mask, np.int32).reshape((-1, 1, 2))
                 cv2.fillPoly(mask_canvas, [pts], 1)
     
-    # 픽셀당 실제 크기 계산 (아이폰 메인 카메라 렌즈 화각 기준)
     fov_radians = math.radians(70 / 2)
-    # 측정된 거리를 기반으로 한 화면의 실제 가로폭(cm)
     real_view_width_cm = 2 * (physical_dist_m * 100) * math.tan(fov_radians)
     cm_per_px = real_view_width_cm / image_np.shape[1]
     
-    # 균열 마킹 (빨간색 오버레이)
     draw_img[mask_canvas == 1] = [255, 0, 0]
     
     max_thickness_px = 0
@@ -69,6 +66,7 @@ def analyze_captured_image(image_np, physical_dist_m, results_crack):
 
 # 4. AR 카메라 컴포넌트
 def ar_scanner_component():
+    # 데이터 전송 시 'Streamlit.setComponentValue'가 안정적으로 작동하도록 감싸는 로직
     ar_html = """
     <div id="wrapper" style="position: relative; width: 100%; height: 500px; background: #000; border-radius: 20px; overflow: hidden; border: 3px solid #333;">
         <video id="video" style="width: 100%; height: 100%; object-fit: cover;" autoplay playsinline></video>
@@ -82,6 +80,16 @@ def ar_scanner_component():
     </div>
 
     <script>
+        // 스트림릿과 통신하기 위한 객체 확인
+        function sendMessage(data) {
+            if (window.Streamlit) {
+                window.Streamlit.setComponentValue(data);
+            } else {
+                // 스트림릿 객체가 로드될 때까지 재시도
+                setTimeout(() => sendMessage(data), 100);
+            }
+        }
+
         const video = document.getElementById('video');
         const canvas = document.getElementById('overlay');
         const ctx = canvas.getContext('2d');
@@ -94,19 +102,17 @@ def ar_scanner_component():
         let currentOri = { alpha: 0, beta: 0 };
         let finalDist = 0;
 
-        // 카메라 설정
         navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } })
             .then(s => { video.srcObject = s; });
 
-        // 센서 권한 및 리스너
         async function initSensor() {
-            if (typeof DeviceOrientationEvent.requestPermission === 'function') {
+            if (window.DeviceOrientationEvent && typeof DeviceOrientationEvent.requestPermission === 'function') {
                 const res = await DeviceOrientationEvent.requestPermission();
                 if (res === 'granted') {
                     window.addEventListener('deviceorientation', e => { currentOri = {alpha: e.alpha, beta: e.beta}; });
                 }
             } else {
-                window.addEventListener('deviceorientation', e => { currentOri = {alpha: e.alpha, beta: e.beta}; });
+                window.addEventListener('deviceorientation', e => { currentOri = {alpha: e.alpha || 0, beta: e.beta || 0}; });
             }
         }
 
@@ -114,39 +120,29 @@ def ar_scanner_component():
             canvas.width = video.clientWidth;
             canvas.height = video.clientHeight;
             ctx.clearRect(0, 0, canvas.width, canvas.height);
-
             const centerX = canvas.width / 2;
             const centerY = canvas.height / 2;
 
-            // 조준점 가이드
             ctx.strokeStyle = "rgba(255, 255, 255, 0.8)";
             ctx.lineWidth = 2;
             ctx.beginPath(); ctx.arc(centerX, centerY, 15, 0, Math.PI*2); ctx.stroke();
 
             if (isMeasuring && startOri) {
-                // 시작점으로부터의 각도 차이를 화면 좌표로 환산 (감도 조절 가능)
                 const sensitivity = 25; 
                 const offsetX = (currentOri.alpha - startOri.alpha) * sensitivity;
                 const offsetY = (currentOri.beta - startOri.beta) * sensitivity;
-
                 const startPointX = centerX - offsetX;
                 const startPointY = centerY + offsetY;
 
-                // 1. 시작점에 고정된 점 그리기
                 ctx.fillStyle = "lime";
                 ctx.beginPath(); ctx.arc(startPointX, startPointY, 8, 0, Math.PI*2); ctx.fill();
 
-                // 2. 시작점과 현재 중앙(조준점) 사이의 선 그리기
                 ctx.setLineDash([5, 5]);
                 ctx.strokeStyle = "#00FF00";
                 ctx.lineWidth = 3;
-                ctx.beginPath();
-                ctx.moveTo(startPointX, startPointY);
-                ctx.lineTo(centerX, centerY);
-                ctx.stroke();
+                ctx.beginPath(); ctx.moveTo(startPointX, startPointY); ctx.lineTo(centerX, centerY); ctx.stroke();
                 ctx.setLineDash([]);
 
-                // 거리 계산
                 const dAlpha = Math.abs(currentOri.alpha - startOri.alpha) * (Math.PI/180);
                 const dBeta = Math.abs(currentOri.beta - startOri.beta) * (Math.PI/180);
                 finalDist = Math.sqrt(Math.pow(dAlpha, 2) + Math.pow(dBeta, 2)) * 1.5;
@@ -163,24 +159,21 @@ def ar_scanner_component():
                 isMeasuring = true;
                 mainBtn.innerText = "끝점 & 분석시작";
                 mainBtn.style.background = "#007AFF";
-                status.innerText = "측정 중...";
             } else {
-                // 캡처 및 전송
                 const tempCanvas = document.createElement('canvas');
                 tempCanvas.width = video.videoWidth;
                 tempCanvas.height = video.videoHeight;
                 tempCanvas.getContext('2d').drawImage(video, 0, 0);
                 const base64Img = tempCanvas.toDataURL('image/jpeg', 0.8);
 
-                // Streamlit으로 확실하게 데이터 전송
-                Streamlit.setComponentValue({
+                sendMessage({
                     img: base64Img, 
                     dist: finalDist,
-                    ts: Date.now() // 강제 새로고침용 타임스탬프
+                    ts: Date.now()
                 });
                 
-                status.innerText = "분석 전송됨!";
-                mainBtn.innerText = "분석 완료";
+                status.innerText = "데이터 전송 중...";
+                mainBtn.innerText = "분석 중...";
                 mainBtn.disabled = true;
             }
         };
@@ -188,40 +181,41 @@ def ar_scanner_component():
         resetBtn.onclick = () => { window.location.reload(); };
     </script>
     """
-    # Streamlit 기본 JS SDK 포함
-    full_html = f"<script src='https://cdn.jsdelivr.net/npm/@streamlit/component-lib@1.4.0/dist/index.min.js'></script>{ar_html}"
-    return components.html(full_html, height=550)
+    return components.html(ar_html, height=550)
 
-# 5. 메인 실행부
-# AR 컴포넌트 호출 및 결과값 받기
-result = ar_scanner_component()
+# 5. 메인 실행부 (에러 방어 로직 강화)
+# 컴포넌트 결과값을 안전하게 가져오기
+result_data = ar_scanner_component()
 
-if result:
-    captured_img_b64 = result.get("img")
-    measured_dist = result.get("dist")
+# 에러가 발생했던 부분: result_data가 None이거나 dict가 아닐 경우를 철저히 체크
+if result_data and isinstance(result_data, dict):
+    # .get()을 사용하여 키가 없어도 에러가 나지 않게 함
+    captured_img_b64 = result_data.get("img")
+    measured_dist = result_data.get("dist", 0)
 
     if captured_img_b64 and measured_dist > 0:
         st.divider()
         st.subheader("🔍 분석 리포트")
         
-        # Base64 이미지 디코딩
-        img_data = base64.b64decode(captured_img_b64.split(',')[1])
-        image = Image.open(BytesIO(img_data))
-        img_array = np.array(image.convert("RGB"))
+        try:
+            # Base64 이미지 디코딩 및 전처리
+            img_data = base64.b64decode(captured_img_b64.split(',')[1])
+            image = Image.open(BytesIO(img_data))
+            img_array = np.array(image.convert("RGB"))
 
-        with st.spinner("AI 균열 정밀 분석 중..."):
-            res = model_crack.predict(source=img_array, conf=0.25, verbose=False)
-            final_img, area, thickness = analyze_captured_image(img_array, measured_dist, res)
-            
-            st.image(final_img, caption=f"측정 거리 {measured_dist:.3f}m 기준 분석 완료", use_container_width=True)
-            
-            c1, c2 = st.columns(2)
-            c1.metric("📐 탐지된 균열 면적", f"{area:.2f} cm²")
-            c2.metric("🔥 최대 균열 폭", f"{thickness:.2f} mm")
-            
-            if area == 0:
-                st.warning("균열이 탐지되지 않았습니다. 더 가까이서 다시 촬영해 보세요.")
+            with st.spinner("AI 균열 정밀 분석 중..."):
+                res = model_crack.predict(source=img_array, conf=0.25, verbose=False)
+                final_img, area, thickness = analyze_captured_image(img_array, measured_dist, res)
+                
+                st.image(final_img, caption=f"측정 거리 {measured_dist:.3f}m 기준 분석 결과", use_container_width=True)
+                
+                c1, c2 = st.columns(2)
+                c1.metric("📐 탐지된 균열 면적", f"{area:.2f} cm²")
+                c2.metric("🔥 최대 균열 폭", f"{thickness:.2f} mm")
+        except Exception as e:
+            st.error(f"이미지 분석 중 오류가 발생했습니다: {e}")
     else:
-        st.info("시작점을 누르고 이동한 뒤 [끝점 & 분석시작]을 눌러주세요.")
+        st.info("준비되었습니다. 위 화면에서 균열의 시작과 끝을 지정해주세요.")
 else:
-    st.info("카메라 화면이 나오면 균열의 왼쪽 끝에서 [시작점 고정]을 눌러주세요.")
+    # 최초 로드 시 result_data는 None이므로 아무것도 하지 않고 대기
+    st.info("카메라 권한을 허용하고 [시작점 고정]을 눌러주세요.")
