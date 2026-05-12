@@ -5,207 +5,261 @@ import numpy as np
 import cv2
 import os
 import math
-import streamlit.components.v1 as components
-import base64
-from io import BytesIO
+from streamlit_drawable_canvas import st_canvas
 
+# ============================================================
 # 1. 초기 설정
-st.set_page_config(page_title="벽면 균열 실시간 진단", page_icon="🏗️", layout="wide")
+# ============================================================
+st.set_page_config(page_title="콘크리트 균열 정밀 진단 V4", page_icon="🏗️", layout="wide")
+st.title("🏗️ 콘크리트 균열 정밀 진단 V4.0")
+st.caption("아이폰 측정앱 방식: 사진 위에서 **시작점 → 끝점**을 찍으면 그 구간의 균열을 mm 단위로 분석합니다.")
 
-# 모델 로드 (캐싱)
+# HEIC 지원
+try:
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+    HEIC_OK = True
+except ImportError:
+    HEIC_OK = False
+
+# ============================================================
+# 2. 모델 로드
+# ============================================================
 @st.cache_resource
 def load_model():
-    MODEL_PATH = "bestcrack.pt"
-    if not os.path.exists(MODEL_PATH):
-        MODEL_PATH = os.path.expanduser("~/Desktop/bestcrack.pt")
-    return YOLO(MODEL_PATH)
+    for p in ["bestcrack.pt", os.path.expanduser("~/Desktop/bestcrack.pt")]:
+        if os.path.exists(p):
+            return YOLO(p)
+    return None
 
-try:
-    model_crack = load_model()
-except Exception as e:
-    st.error(f"모델 로드 실패: {e}")
+model_crack = load_model()
+if model_crack is None:
+    st.error("❌ bestcrack.pt 모델 파일을 찾을 수 없습니다.")
     st.stop()
 
-# 2. 분석 함수
-def analyze_captured_image(image_np, physical_dist_m, results_crack):
-    draw_img = image_np.copy()
-    if not results_crack or len(results_crack) == 0 or results_crack[0].masks is None:
-        return draw_img, 0, 0
-    
-    result = results_crack[0]
-    mask_canvas = np.zeros(image_np.shape[:2], dtype=np.uint8)
-    
-    for mask in result.masks.xy:
-        if len(mask) > 0:
-            pts = np.array(mask, np.int32).reshape((-1, 1, 2))
-            cv2.fillPoly(mask_canvas, [pts], 1)
-    
-    # 세로 모드(Portrait) 화각 보정 (아이폰 기준 약 58도)
-    fov_radians = math.radians(58 / 2)
-    real_view_width_cm = 2 * (physical_dist_m * 100) * math.tan(fov_radians)
-    cm_per_px = real_view_width_cm / image_np.shape[1]
-    
-    # 결과 시각화
-    draw_img[mask_canvas == 1] = [255, 0, 0] # 균열 빨간색
-    dist_transform = cv2.distanceTransform(mask_canvas, cv2.DIST_L2, 3)
-    max_thickness_px = np.max(dist_transform) * 2 if np.any(dist_transform) else 0
-    
-    area_cm2 = np.sum(mask_canvas) * (cm_per_px**2)
-    thick_mm = max_thickness_px * (cm_per_px * 10)
-    
-    return draw_img, area_cm2, thick_mm
+# ============================================================
+# 3. 세션 상태
+# ============================================================
+if "captured_image" not in st.session_state:
+    st.session_state.captured_image = None
+if "analysis_result" not in st.session_state:
+    st.session_state.analysis_result = None
 
-# 3. 벽면 특화 AR 컴포넌트
-def ar_wall_scanner():
-    ar_html = """
-    <div id="wrapper" style="position: relative; width: 100%; height: 550px; background: #000; border-radius: 15px; overflow: hidden;">
-        <video id="video" style="width: 100%; height: 100%; object-fit: cover;" autoplay playsinline></video>
-        <canvas id="overlay" style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none;"></canvas>
-        
-        <div id="controls" style="position: absolute; bottom: 20px; width: 100%; display: flex; justify-content: center; gap: 10px;">
-            <button id="btnAction" style="padding: 15px 25px; background: #FF4B4B; color: white; border: none; border-radius: 30px; font-weight: bold;">시작점 고정</button>
-            <button id="btnReset" style="padding: 15px 25px; background: #333; color: white; border: none; border-radius: 30px;">초기화</button>
-        </div>
-        <div id="info" style="position: absolute; top: 15px; left: 15px; color: #00FF00; background: rgba(0,0,0,0.7); padding: 5px 12px; border-radius: 5px; font-family: monospace; font-size: 12px;">WALL SCANNER READY</div>
-    </div>
-
-    <script>
-        const video = document.getElementById('video');
-        const canvas = document.getElementById('overlay');
-        const ctx = canvas.getContext('2d');
-        const btnAction = document.getElementById('btnAction');
-        const info = document.getElementById('info');
-
-        let isMeasuring = false;
-        let startPoint = null;
-        let currentOri = { a: 0, b: 0, g: 0 };
-        let distResult = 0;
-
-        navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } }).then(s => video.srcObject = s);
-
-        async function requestPerm() {
-            if (typeof DeviceOrientationEvent.requestPermission === 'function') {
-                const res = await DeviceOrientationEvent.requestPermission();
-                if (res === 'granted') window.addEventListener('deviceorientation', e => { currentOri = {a:e.alpha, b:e.beta, g:e.gamma}; });
-            } else {
-                window.addEventListener('deviceorientation', e => { currentOri = {a:e.alpha, b:e.beta, g:e.gamma}; });
-            }
-        }
-
-        function draw() {
-            canvas.width = video.clientWidth;
-            canvas.height = video.clientHeight;
-            ctx.clearRect(0, 0, canvas.width, canvas.height);
-            const cx = canvas.width / 2;
-            const cy = canvas.height / 2;
-
-            // 중앙 레티클
-            ctx.strokeStyle = "white"; ctx.lineWidth = 2;
-            ctx.beginPath(); ctx.arc(cx, cy, 20, 0, Math.PI*2); ctx.stroke();
-            ctx.fillStyle = "red"; ctx.beginPath(); ctx.arc(cx, cy, 4, 0, Math.PI*2); ctx.fill();
-
-            if (isMeasuring && startPoint) {
-                // 벽면(90도 세움) 기준 좌표 보정: alpha(좌우), beta(상하) 사용
-                // 폰을 세웠을 때 alpha의 변화가 좌우 이동을 가장 잘 나타냄
-                let dx = (currentOri.a - startPoint.a);
-                if (dx > 180) dx -= 360; if (dx < -180) dx += 360; // 각도 끊김 방지
-                
-                const dy = (currentOri.b - startPoint.b);
-
-                const sens = 30; // 화면 표시 감도
-                const sx = cx - (dx * sens);
-                const sy = cy + (dy * sens);
-
-                // 시작점 표시 (초록점)
-                ctx.fillStyle = "#00FF00";
-                ctx.beginPath(); ctx.arc(sx, sy, 10, 0, Math.PI*2); ctx.fill();
-
-                // 연결 점선
-                ctx.setLineDash([5, 5]);
-                ctx.strokeStyle = "#00FF00";
-                ctx.beginPath(); ctx.moveTo(sx, sy); ctx.lineTo(cx, cy); ctx.stroke();
-                ctx.setLineDash([]);
-
-                // 실제 물리 거리 계산 (라디안 변환)
-                const radX = Math.abs(dx) * (Math.PI/180);
-                const radY = Math.abs(dy) * (Math.PI/180);
-                distResult = Math.sqrt(Math.pow(radX, 2) + Math.pow(radY, 2)) * 1.5; // 벽면 보정계수
-                info.innerText = "MEASURING: " + distResult.toFixed(3) + "m";
-            }
-            requestAnimationFrame(draw);
-        }
-        draw();
-
-        btnAction.onclick = async () => {
-            await requestPerm();
-            if (!isMeasuring) {
-                startPoint = {...currentOri};
-                isMeasuring = true;
-                btnAction.innerText = "분석 시작 (캡처)";
-                btnAction.style.background = "#007AFF";
-            } else {
-                // 캡처 후 데이터 전송
-                const tempCanvas = document.createElement('canvas');
-                tempCanvas.width = video.videoWidth;
-                tempCanvas.height = video.videoHeight;
-                tempCanvas.getContext('2d').drawImage(video, 0, 0);
-                const b64 = tempCanvas.toDataURL('image/jpeg', 0.7);
-
-                if (window.Streamlit) {
-                    window.Streamlit.setComponentValue({ img: b64, dist: distResult, ts: Date.now() });
-                }
-                btnAction.innerText = "분석 중...";
-                btnAction.disabled = true;
-            }
-        };
-        document.getElementById('btnReset').onclick = () => window.location.reload();
-    </script>
+# ============================================================
+# 4. 분석 함수 (두 점 사이 ROI 영역의 균열만 분석)
+# ============================================================
+def analyze_crack_between_points(image_np, p1, p2, real_length_cm,
+                                  conf_threshold=0.25, dilation_iter=1):
     """
-    return components.html(ar_html, height=580)
+    p1, p2          : 원본 이미지 픽셀 좌표 (x, y)
+    real_length_cm  : 사용자가 입력한 p1-p2의 실제 거리 (cm)
+    """
+    draw_img = image_np.copy()
+    overlay = image_np.copy()
 
-# 4. 메인 실행 로직
-st.subheader("🏗️ 벽면 전용 실시간 균열 분석기")
+    # ── 1) 픽셀 거리 → mm 스케일 (FOV 추정 불필요, 정확함) ──
+    px_dist = math.hypot(p2[0] - p1[0], p2[1] - p1[1])
+    if px_dist < 5:
+        return draw_img, 0, 0, 0, "두 점이 너무 가깝습니다."
 
-# 결과값을 세션 스테이트로 관리하여 새로고침 시 날아가는 것 방지
-if 'analysis_done' not in st.session_state:
-    st.session_state.analysis_done = False
+    mm_per_pixel = (real_length_cm * 10.0) / px_dist
+    cm_per_pixel = mm_per_pixel / 10.0
 
-res_data = ar_wall_scanner()
+    # ── 2) YOLO 균열 탐지 ──
+    results = model_crack.predict(source=image_np, conf=conf_threshold, verbose=False)
+    if not results or results[0].masks is None:
+        cv2.line(draw_img, p1, p2, (0, 255, 255), 3)
+        cv2.circle(draw_img, p1, 10, (0, 255, 0), -1)
+        cv2.circle(draw_img, p2, 10, (0, 0, 255), -1)
+        return draw_img, 0, 0, mm_per_pixel, "균열이 탐지되지 않았습니다."
 
-# 데이터가 들어오면 분석 실행
-if res_data and isinstance(res_data, dict) and "img" in res_data:
-    b64_img = res_data.get("img")
-    dist = res_data.get("dist", 0)
-    
-    if b64_img and dist > 0:
-        st.divider()
-        with st.status("🔍 AI 균열 분석 엔진 가동 중...", expanded=True) as status:
-            try:
-                # 1. 이미지 복원
-                raw_b64 = b64_img.split(',')[1]
-                img_bytes = base64.b64decode(raw_b64)
-                img = Image.open(BytesIO(img_bytes))
-                img_np = np.array(img.convert("RGB"))
+    result = results[0]
 
-                # 2. YOLO 예측
-                results = model_crack.predict(source=img_np, conf=0.25, verbose=False)
-                
-                # 3. 수치 계산 및 그리기
-                processed_img, area, thick = analyze_captured_image(img_np, dist, results)
+    # ── 3) 전체 균열 마스크 ──
+    H, W = image_np.shape[:2]
+    full_mask = np.zeros((H, W), dtype=np.uint8)
+    for m in result.masks.xy:
+        if len(m) > 0:
+            pts = np.array(m, np.int32).reshape((-1, 1, 2))
+            cv2.fillPoly(full_mask, [pts], 1)
 
-                # 4. 결과 출력
-                st.image(processed_img, caption=f"분석 완료 (측정 거리: {dist:.3f}m)", use_container_width=True)
-                
-                c1, c2 = st.columns(2)
-                c1.metric("📐 균열 총 면적", f"{area:.2f} cm²")
-                c2.metric("🔥 최대 균열 폭", f"{thick:.2f} mm")
-                
-                status.update(label="✅ 분석이 성공적으로 완료되었습니다!", state="complete", expanded=False)
-                st.session_state.analysis_done = True
-                
-            except Exception as e:
-                st.error(f"분석 중 오류 발생: {e}")
-                status.update(label="❌ 분석 실패", state="error")
+    # ── 4) 팽창 교정 ──
+    if dilation_iter > 0:
+        kernel = np.ones((3, 3), np.uint8)
+        full_mask = cv2.dilate(full_mask, kernel, iterations=dilation_iter)
 
+    # ── 5) 두 점을 잇는 띠(ROI) 생성 ──
+    roi_mask = np.zeros((H, W), dtype=np.uint8)
+    band_thickness = max(int(px_dist * 0.3), 40)  # 균열이 곧지 않을 수 있어 여유
+    cv2.line(roi_mask, p1, p2, 1, thickness=band_thickness * 2)
+
+    # ── 6) ROI ∩ 균열 ──
+    target_mask = full_mask & roi_mask
+
+    # ── 7) 면적 / 최대폭 ──
+    total_px = int(np.sum(target_mask))
+    area_cm2 = total_px * (cm_per_pixel ** 2)
+
+    max_thick_mm = 0
+    if total_px > 0:
+        dist_tf = cv2.distanceTransform(target_mask, cv2.DIST_L2, 3)
+        max_thick_mm = float(np.max(dist_tf)) * 2 * mm_per_pixel
+
+    # ── 8) 시각화 ──
+    overlay[roi_mask == 1] = (255, 255, 0)       # ROI: 연노랑
+    overlay[target_mask == 1] = (255, 0, 0)      # 균열: 빨강
+    cv2.addWeighted(overlay, 0.4, draw_img, 0.6, 0, draw_img)
+
+    contours, _ = cv2.findContours(target_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(draw_img, contours, -1, (255, 0, 0), 2)
+
+    # 측정선 + 양 끝점
+    cv2.line(draw_img, p1, p2, (0, 255, 255), 3)
+    cv2.circle(draw_img, p1, 12, (0, 255, 0), -1)
+    cv2.circle(draw_img, p1, 12, (255, 255, 255), 2)
+    cv2.circle(draw_img, p2, 12, (0, 0, 255), -1)
+    cv2.circle(draw_img, p2, 12, (255, 255, 255), 2)
+
+    # 거리 라벨
+    mid = ((p1[0] + p2[0]) // 2, (p1[1] + p2[1]) // 2)
+    label = f"{real_length_cm:.1f} cm ({px_dist:.0f}px)"
+    cv2.putText(draw_img, label, (mid[0] + 10, mid[1] - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 4)
+    cv2.putText(draw_img, label, (mid[0] + 10, mid[1] - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
+
+    return draw_img, area_cm2, max_thick_mm, mm_per_pixel, "OK"
+
+# ============================================================
+# 5. 이미지 입력
+# ============================================================
+st.markdown("### 📷 1단계 · 이미지 입력")
+types = ["jpg", "jpeg", "png"] + (["heic", "heif"] if HEIC_OK else [])
+
+tab1, tab2 = st.tabs(["📁 업로드", "📸 카메라 촬영"])
+with tab1:
+    up = st.file_uploader("이미지 선택", type=types)
+    if up:
+        st.session_state.captured_image = ImageOps.exif_transpose(Image.open(up)).convert("RGB")
+        st.session_state.analysis_result = None
+with tab2:
+    cam = st.camera_input("균열을 정면(90°)에서 촬영")
+    if cam:
+        st.session_state.captured_image = ImageOps.exif_transpose(Image.open(cam)).convert("RGB")
+        st.session_state.analysis_result = None
+
+# ============================================================
+# 6. 2점 찍기 + 분석
+# ============================================================
+if st.session_state.captured_image is not None:
+    image = st.session_state.captured_image
+    img_np = np.array(image)
+    H, W = img_np.shape[:2]
+
+    st.markdown("### 🎯 2단계 · 시작점 → 끝점 찍기")
+    st.info(
+        "👉 아래 이미지에서 **균열의 시작점을 클릭, 이어서 끝점을 클릭**하세요.\n\n"
+        "📏 그 다음 두 점 사이의 **실제 거리(cm)**를 입력합니다. "
+        "(자/줄자로 재거나, 옆에 둔 동전·벽돌처럼 길이를 아는 기준물 활용)"
+    )
+
+    # 캔버스 표시 크기
+    DISPLAY_W = 700
+    scale = DISPLAY_W / W
+    DISPLAY_H = int(H * scale)
+
+    col_canvas, col_info = st.columns([2, 1])
+
+    with col_canvas:
+        canvas_res = st_canvas(
+            fill_color="rgba(255, 0, 0, 0.3)",
+            stroke_width=8,
+            stroke_color="#00FF00",
+            background_image=image.resize((DISPLAY_W, DISPLAY_H)),
+            update_streamlit=True,
+            height=DISPLAY_H,
+            width=DISPLAY_W,
+            drawing_mode="point",
+            point_display_radius=8,
+            key="canvas",
+        )
+
+    with col_info:
+        st.markdown("#### ⚙️ 측정 설정")
+        real_cm = st.number_input(
+            "📏 두 점 사이의 실제 거리 (cm)",
+            min_value=0.5, value=10.0, step=0.5,
+            help="자로 잰 실제 거리. 정확할수록 결과도 정확합니다.\n"
+                 "💡 기준물 예시 — 500원: 2.65cm / 표준벽돌 길이: 19cm / 신용카드 가로: 8.56cm"
+        )
+        conf_th = st.slider("탐지 민감도", 0.05, 0.95, 0.25, 0.05)
+        dilation = st.slider("마스킹 팽창 교정", 0, 5, 1)
+
+        # 찍힌 점 추출
+        points = []
+        if canvas_res.json_data is not None:
+            for o in canvas_res.json_data.get("objects", []):
+                if o.get("type") == "circle":
+                    cx = (o["left"] + o.get("radius", 0)) / scale
+                    cy = (o["top"] + o.get("radius", 0)) / scale
+                    points.append((int(cx), int(cy)))
+
+        st.markdown(f"**찍힌 점: {len(points)}개**")
+        if len(points) >= 1:
+            st.write(f"🟢 시작점: {points[0]}")
+        if len(points) >= 2:
+            st.write(f"🔴 끝점: {points[1]}")
+            px_d = math.hypot(points[1][0]-points[0][0], points[1][1]-points[0][1])
+            st.write(f"📐 픽셀 거리: {px_d:.1f} px")
+            st.write(f"🔬 스케일: 1px ≈ {(real_cm*10/px_d):.3f} mm")
+        if len(points) > 2:
+            st.warning("⚠️ 점이 3개 이상입니다. 캔버스 휴지통(🗑️)으로 지우거나, 처음 2개만 사용됩니다.")
+
+        analyze_btn = st.button(
+            "🚀 측정 시작",
+            type="primary",
+            use_container_width=True,
+            disabled=(len(points) < 2),
+        )
+
+    # ── 분석 실행 ──
+    if analyze_btn and len(points) >= 2:
+        p1, p2 = points[0], points[1]
+        with st.spinner("AI 분석 중..."):
+            result_img, area, thick, mmpp, msg = analyze_crack_between_points(
+                img_np, p1, p2, real_cm,
+                conf_threshold=conf_th,
+                dilation_iter=dilation,
+            )
+            st.session_state.analysis_result = {
+                "img": result_img, "area": area, "thick": thick,
+                "mmpp": mmpp, "msg": msg, "real_cm": real_cm
+            }
+
+    # ── 결과 표시 ──
+    if st.session_state.analysis_result is not None:
+        st.markdown("---")
+        st.markdown("### ✨ 3단계 · 분석 결과")
+        r = st.session_state.analysis_result
+
+        st.image(r["img"], use_container_width=True,
+                 caption=f"분석 결과 (스케일: 1px ≈ {r['mmpp']:.3f} mm)")
+
+        if r["area"] > 0:
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("📐 균열 면적", f"{r['area']:.2f} cm²")
+            m2.metric("🔥 최대 균열 폭", f"{r['thick']:.2f} mm")
+            m3.metric("📏 측정 기준", f"{r['real_cm']:.1f} cm")
+            status_lbl = "⚠️ 보수 필요" if r["thick"] >= 0.3 else "✅ 양호"
+            m4.metric("📋 안전 진단", status_lbl)
+
+            with st.expander("ℹ️ 균열 폭 진단 기준"):
+                st.markdown("""
+                - **0.3 mm 미만** : 일반적으로 구조 안전성에 큰 영향 없음 (양호)
+                - **0.3 mm 이상** : 철근 부식 우려, 보수 권장
+                - **1.0 mm 이상** : 구조적 문제 가능성, 정밀 점검 필요
+                """)
+        else:
+            st.warning(f"⚠️ {r['msg']}")
 else:
-    st.info("💡 **사용 방법**\n1. 폰을 벽과 평행하게 **90도로 세웁니다.**\n2. 균열 시작점에 빨간점을 맞추고 **[시작점 고정]**을 누릅니다.\n3. 폰을 옆으로 천천히 움직여 균열 끝에서 **[분석 시작]**을 누릅니다.")
+    st.info("👆 위에서 이미지를 업로드하거나 촬영해주세요.")
